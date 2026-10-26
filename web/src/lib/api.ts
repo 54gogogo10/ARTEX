@@ -122,7 +122,9 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       ...(init?.headers as Record<string, string> | undefined),
     },
   });
-  if (r.status === 401) {
+  // /auth/* 的 401 是业务结果（密码错误、旧密码不对），不是会话过期：
+  // 清 token + 跳登录会把改密弹窗的用户直接登出，还会吞掉登录页的错误提示。
+  if (r.status === 401 && !path.startsWith("/auth/")) {
     if (typeof window !== "undefined") {
       localStorage.removeItem("artex_token");
       document.cookie = "artex_token=; path=/; max-age=0";
@@ -192,8 +194,11 @@ export function sseUrl(path: string): string {
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
       ? `${window.location.protocol}//${window.location.hostname}:8787`
       : "");
-  const token = getToken();
+  // 同源（生产静态导出）时 EventSource 会自动携带 artex_token cookie，token
+  // 绝不能拼进 URL——那会落进访问日志/反代日志和 Referer。?token= 只在跨源的
+  // dev 直连 :8787 场景（cookie 不跨源）才需要。
   const sep = path.includes("?") ? "&" : "?";
+  const token = base ? getToken() : null;
   return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
 }
 
@@ -241,7 +246,10 @@ export const api = {
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
   initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
   changePassword: (oldPassword: string, newPassword: string) =>
-    post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
+    post<{ ok: boolean; token?: string }>("/auth/change-password", {
+      old_password: oldPassword,
+      new_password: newPassword,
+    }),
 
   // ---- tasks ----
   tasks: () =>

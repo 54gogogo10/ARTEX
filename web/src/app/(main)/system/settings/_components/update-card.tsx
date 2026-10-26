@@ -45,6 +45,19 @@ export function UpdateCard() {
   const [restarting, setRestarting] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
 
+  // 更新进行中离开设置页时：SSE 连接要关闭，3 分钟的重启轮询要停下，
+  // 不能继续对着已卸载的组件 setState / toast。
+  const aliveRef = React.useRef(true);
+  const esRef = React.useRef<EventSource | null>(null);
+  React.useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      esRef.current?.close();
+      esRef.current = null;
+    };
+  }, []);
+
   // quiet 同时决定要不要绕过后端缓存：进页面时的自动检查用缓存（顶栏刚查过），
   // 用户手动点「检查更新」则强制回源，否则刚发布的版本要等缓存过期才看得到。
   const check = React.useCallback((quiet = false) => {
@@ -78,14 +91,16 @@ export function UpdateCard() {
     const deadline = Date.now() + RESTART_TIMEOUT_MS;
     while (Date.now() < deadline) {
       await sleep(2000);
+      if (!aliveRef.current) return;
       try {
         const r = await fetch("/api/health", { cache: "no-store" });
         if (r.ok) {
           const j = (await r.json()) as { version?: string };
           if (j.version && j.version !== fromVersion) {
+            if (!aliveRef.current) return;
             toast.success(`已更新到 ${j.version}，正在重新加载页面`);
             await sleep(800);
-            window.location.reload();
+            if (aliveRef.current) window.location.reload();
             return;
           }
         }
@@ -93,6 +108,7 @@ export function UpdateCard() {
         // 重启窗口内连不上是预期的，继续轮询。
       }
     }
+    if (!aliveRef.current) return;
     setRestarting(false);
     toast.error("等待服务重启超时。请检查后端日志，或确认 artex 是通过 start.sh / start.bat 启动的。");
   }, []);
@@ -101,6 +117,7 @@ export function UpdateCard() {
   const openStream = React.useCallback(
     (fromVersion: string) => {
       const es = new EventSource(sseUrl("/api/update/stream"));
+      esRef.current = es;
       es.onmessage = (ev) => {
         let p: UpdateProgress;
         try {

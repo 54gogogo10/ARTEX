@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -95,8 +97,8 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
 			continue
 		}
-		dest := uniqueUploadPath(dir, name)
-		if err := saveUpload(hdr, dest); err != nil {
+		dest, err := saveUploadUnique(hdr, dir, name)
+		if err != nil {
 			writeErr(w, 500, "保存失败: "+err.Error())
 			return
 		}
@@ -106,20 +108,40 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"attachments": out})
 }
 
-// uniqueUploadPath returns dir/name, or dir/name-1, dir/name-2… when it already exists,
-// so re-uploading the same filename never clobbers a prior attachment.
-func uniqueUploadPath(dir, name string) string {
-	dest := filepath.Join(dir, name)
-	if _, err := os.Stat(dest); os.IsNotExist(err) {
-		return dest
-	}
+// saveUploadUnique writes hdr's content into dir under name, or name-1, name-2…
+// picking the suffix and creating the file in a single O_CREATE|O_EXCL step, so
+// two concurrent uploads of the same filename can never truncate each other.
+// (The previous Stat-then-Create two-stepper had exactly that TOCTOU window.)
+func saveUploadUnique(hdr *multipart.FileHeader, dir, name string) (string, error) {
 	ext := filepath.Ext(name)
 	stem := strings.TrimSuffix(name, ext)
-	for i := 1; ; i++ {
-		cand := filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, i, ext))
-		if _, err := os.Stat(cand); os.IsNotExist(err) {
-			return cand
+	var dest string
+	for i := 0; ; i++ {
+		cand := name
+		if i > 0 {
+			cand = fmt.Sprintf("%s-%d%s", stem, i, ext)
 		}
+		dest = filepath.Join(dir, cand)
+		out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if os.IsExist(err) {
+			continue // suffix taken, try the next one
+		} else if err != nil {
+			return "", err
+		}
+		src, err := hdr.Open()
+		if err != nil {
+			out.Close()
+			return "", err
+		}
+		_, err = io.Copy(out, src)
+		src.Close()
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return "", err
+		}
+		return dest, nil
 	}
 }
 

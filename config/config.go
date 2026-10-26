@@ -181,7 +181,8 @@ func (d Database) buildDSN() string {
 func Redact(dsn string) string {
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return dsn
+		// 解析失败的原始串可能携带明文密码，不能原样进日志。
+		return "[unparseable-dsn]"
 	}
 	if u.User != nil {
 		if _, hasPw := u.User.Password(); hasPw {

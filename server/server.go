@@ -44,7 +44,13 @@ type Server struct {
 	ctx    context.Context
 
 	skillDir string // root directory for skill subdirectories
-	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	// jwtKey is the HS256 signing key (reads guarded by jwtKeyMu). It is rotated
+	// in place on a successful password change — stateless JWTs otherwise stay
+	// valid for up to jwtTTL regardless of the password, leaving no way to
+	// revoke a stolen token short of a restart.
+	jwtKey   []byte
+	jwtKeyMu sync.RWMutex
+	keyDir   string // where jwt.key lives; kept for in-process rotation
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -145,7 +151,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, keyDir: keyDir, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -226,11 +232,13 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			log.Printf("[retester] seed: %v", err)
 		}
 		go s.evidenceStore().RunGC(s.ctx)
-		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
-		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
+		s.seedPythonInterpreter() // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
+		// P3 触发器调度(定时/finding/目标事件),仅自定义 agent。goRecover:常驻
+		// 循环 panic 只损失本次调度并自动重试，不拖垮整个进程和运行中的任务。
+		goRecover("scheduler", func() { newScheduler(s).Run(s.ctx) })
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
-		go newNotifier(s).Run(s.ctx)
+		goRecover("notifier", func() { newNotifier(s).Run(s.ctx) })
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
 		go s.discoverEmptyMCPsOnStartup()
@@ -3107,6 +3115,10 @@ func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page := atoiDefault(q.Get("page"), 0)
 	size := atoiDefault(q.Get("size"), 100)
+	// 防御性上限：流量库可能积累数十万条，size=9999999 会把全表载入内存再序列化。
+	if size > 500 {
+		size = 500
+	}
 	ex, matched, _ := tr.Page(traffic.PageQuery{
 		Host:    q.Get("host"),
 		Method:  q.Get("method"),

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -237,6 +238,14 @@ func (e *Engine) registerTaskRoutines(parent context.Context, taskID string, cou
 func runTaskRoutine(rt *taskRuntime, fn func(context.Context)) {
 	go func() {
 		defer rt.wg.Done()
+		// 吞掉 panic 只记日志，不重启 fn：重跑可能重复执行半途的工具调用。
+		// 进程级兜底仍在（start 脚本），但单个例程的边界 panic 不该带崩
+		// 其他正在运行的任务。WaitGroup 的 Done 在 defer 里，goroutine 可正常退出。
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[engine] task routine panic（该例程终止，其余任务不受影响）: %v\n%s", r, debug.Stack())
+			}
+		}()
 		fn(rt.ctx)
 	}()
 }
@@ -1206,6 +1215,11 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 	release = false // ownership of the admission passes to the goroutine
 	go func() {
 		defer e.decInflight(t.ID)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[engine] chat intent panic（task=%s）: %v\n%s", t.ID, r, debug.Stack())
+			}
+		}()
 		e.runIntent(ctx, t, "chat", worker, node, requestID, agentMessage)
 	}()
 	return nil

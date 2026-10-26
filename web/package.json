@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "build:static": "NEXT_EXPORT=1 next build",
+    "build:static": "cross-env NEXT_EXPORT=1 next build",
     "start": "next start",
     "lint": "biome lint",
     "format": "biome format --write",
@@ -71,6 +71,7 @@
     "@types/react-dom": "^19.2.3",
     "@types/topojson-client": "^3.1.5",
     "babel-plugin-react-compiler": "^1.0.0",
+    "cross-env": "^10.1.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
     "postcss": "^8.5.16",

@@ -117,6 +117,12 @@ func run() int {
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// IdleTimeout reaps keep-alive connections that go quiet; without it a
+		// pile of idle conns holds goroutines forever. ReadTimeout/
+		// WriteTimeout are deliberately 0: request bodies are bounded per-route
+		// (http.MaxBytesReader in decode / upload limits), and SSE streams are
+		// unbounded reads/writes that a server-wide deadline would kill.
+		IdleTimeout: 2 * time.Minute,
 	}
 
 	go func() {

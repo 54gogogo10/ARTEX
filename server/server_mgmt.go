@@ -78,7 +78,15 @@ func pathInt(r *http.Request, name string) (int64, bool) {
 	return n, err == nil
 }
 
-func decode(r *http.Request, v any) error { return json.NewDecoder(r.Body).Decode(v) }
+// maxJSONBody bounds request bodies on JSON endpoints. File uploads (skills zip,
+// chat attachments) have their own per-route limits; this stops any single
+// oversized JSON body from being fully buffered into memory.
+const maxJSONBody = 8 << 20
+
+func decode(r *http.Request, v any) error {
+	// nil ResponseWriter is allowed since Go 1.19; we only want the size cap.
+	return json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxJSONBody)).Decode(v)
+}
 
 // ---------- tasks (delete) ----------
 

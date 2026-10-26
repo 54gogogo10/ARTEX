@@ -88,7 +88,8 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 
 		// Async writer: picks from channel and inserts into server_logs.
 		// Uses os.Stderr directly to report errors and avoids recursive log calls.
-		go func() {
+		// goRecover: 日志持久化挂了不该带崩进程，panic 后 10s 重试继续写。
+		goRecover("logsink", func() {
 			for {
 				select {
 				case req, ok := <-ch:
@@ -113,7 +114,7 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 					return
 				}
 			}
-		}()
+		})
 	})
 }
 
