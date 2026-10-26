@@ -96,6 +96,18 @@ const (
 	// maxIndexBody caps a single body's contribution to the full-text index. Text
 	// is indexed in full below this; binary never reaches the index at all.
 	maxIndexBody = 4 * 1024 * 1024
+	// maxCaptureBody caps how much of one request/response body is captured at
+	// all. go-mitmproxy buffers the full body in memory before we see it; past
+	// this size the target is returning bulk data rather than evidence, and
+	// recording it whole grows the store without bound — a resource exhaustion
+	// the target side can trigger on purpose. The exchange row keeps the true
+	// length; the stored body is truncated with a self-describing marker.
+	maxCaptureBody = 4 * 1024 * 1024
+	// blobBudgetBytes caps the total size of the content-addressed blob store.
+	// Over budget, new blobs are not written (large bodies degrade to their
+	// inline preview; metadata and search keep working) — fail-safe rather than
+	// fail-dead, at which point the operator reclaims space via DeleteHost.
+	blobBudgetBytes = 8 << 30
 	// minTrigram is the shortest term the trigram tokenizer can match; shorter
 	// queries fall back to metadata LIKE.
 	minTrigram = 3
@@ -141,6 +153,10 @@ type Traffic struct {
 	wmu   sync.Mutex // serializes record() vs DeleteHost (incl. blob GC)
 	seq   atomic.Int64
 	proxy *mproxy.Proxy
+	// blobBytes tracks the live size of the _blobs store for the
+	// blobBudgetBytes gate; seeded at Open, maintained by spill and the GC.
+	blobBytes    atomic.Int64
+	budgetWarned atomic.Bool
 	// fts reports whether the full-text index is available. False on a driver
 	// build without FTS5: recording and metadata search still work, body search
 	// degrades to unsupported rather than erroring.
@@ -172,6 +188,23 @@ type Traffic struct {
 	upstream atomic.Pointer[url.URL]
 }
 
+// seedBlobBudget sums the existing blob store once at Open so the budget gate
+// accounts for data recorded by previous runs, not just this process's writes.
+func (t *Traffic) seedBlobBudget() {
+	root := filepath.Join(t.dir, "_blobs", "sha256")
+	var total int64
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		if info, ierr := d.Info(); ierr == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	t.blobBytes.Store(total)
+}
+
 // Open initializes the traffic tree, blob store and SQLite index under dir.
 func Open(dir, addr string) (*Traffic, error) {
 	for _, d := range []string{dir, filepath.Join(dir, "_index"), filepath.Join(dir, "_blobs"), filepath.Join(dir, "_ca")} {
@@ -200,6 +233,7 @@ func Open(dir, addr string) (*Traffic, error) {
 		db.Close()
 		return nil, err
 	}
+	t.seedBlobBudget()
 
 	p, err := mproxy.NewProxy(&mproxy.Options{
 		Addr:        addr,
@@ -450,9 +484,12 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	reqHead := fmt.Sprintf("%s %s %s\n%s", method, f.Request.URL.RequestURI(), f.Request.Proto, requestHeaderLines(f.Request))
 	respHead := fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header))
 	// Bodies are spilled before the transaction opens: blob writes are filesystem
-	// work and must not sit inside the SQLite write lock.
-	reqB := t.spill(f.Request.Body, f.Request.Header.Get("Content-Type"))
-	respB := t.spill(f.Response.Body, ct)
+	// work and must not sit inside the SQLite write lock. capBody bounds what a
+	// single oversized response may add to the store; the row keeps the true
+	// sizes so truncation never masquerades as a short response.
+	reqOrig, respOrig := len(f.Request.Body), len(f.Response.Body)
+	reqB := t.spill(capBody(f.Request.Body), f.Request.Header.Get("Content-Type"))
+	respB := t.spill(capBody(f.Response.Body), ct)
 
 	tx, err := t.db.Begin()
 	if err != nil {
@@ -466,7 +503,7 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
 VALUES(?,?,?,?,?,?,?,?,?,?,'')`,
 		id, now.Unix(), host, method, tmpl, url, f.Response.StatusCode, ct,
-		len(f.Request.Body), len(f.Response.Body))
+		reqOrig, respOrig)
 	if err != nil {
 		log.Printf("[traffic] 记录 %s 失败（写索引）：%v", url, err)
 		return
@@ -518,6 +555,20 @@ type storedBody struct {
 	index  string
 }
 
+// capBody applies maxCaptureBody. A truncated body gets a trailing marker so the
+// UI and full-text search say so themselves instead of looking like a short
+// response.
+func capBody(b []byte) []byte {
+	if len(b) <= maxCaptureBody {
+		return b
+	}
+	marker := []byte(fmt.Sprintf("\n[ARTEX] body 超过 %dMB 已截断（原始大小 %d 字节）", maxCaptureBody>>20, len(b)))
+	out := make([]byte, 0, maxCaptureBody+len(marker))
+	out = append(out, b[:maxCaptureBody]...)
+	out = append(out, marker...)
+	return out
+}
+
 // spill decides where one body lives. Small bodies stay inline. Large ones are
 // written to the content-addressed store and keep a readable preview inline so a
 // reader can identify them without fetching the blob. Either way, text bodies
@@ -549,10 +600,20 @@ func (t *Traffic) spill(body []byte, contentType string) storedBody {
 	}
 	blobPath := filepath.Join(blobDir, h+".bin")
 	if _, err := os.Stat(blobPath); os.IsNotExist(err) {
+		if t.blobBytes.Load() >= blobBudgetBytes {
+			// Over budget: keep the preview inline and skip the blob write. This
+			// is the fail-safe against target-driven disk exhaustion — metadata
+			// and search still work, and DeleteHost reclaims budget.
+			if t.budgetWarned.CompareAndSwap(false, true) {
+				log.Printf("[traffic] blob 存储已达 %dMB 预算上限，新的大 body 仅保留内联预览（删除 host 可回收空间）", blobBudgetBytes>>20)
+			}
+			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
+		}
 		if err := os.WriteFile(blobPath, body, 0o644); err != nil {
 			log.Printf("[traffic] 写 blob %s 失败：%v", h, err)
 			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
 		}
+		t.blobBytes.Add(int64(len(body)))
 	}
 	sb := storedBody{hash: h, index: indexText()}
 	if text {
@@ -1836,11 +1897,19 @@ func (t *Traffic) gcBlobs() error {
 		}
 		h := strings.TrimSuffix(d.Name(), ".bin")
 		if _, ok := refs[h]; !ok {
+			if info, ierr := d.Info(); ierr == nil {
+				t.blobBytes.Add(-info.Size())
+			}
 			os.Remove(p)
 		}
 		return nil
 	}); err != nil {
 		return err
+	}
+	// Back under budget means new blobs may be written again — re-arm the
+	// one-shot warning so a future trip re-announces itself.
+	if t.blobBytes.Load() < blobBudgetBytes {
+		t.budgetWarned.Store(false)
 	}
 	// Deepest first, so a two-level bucket left by the old layout collapses fully.
 	// Remove fails harmlessly on a non-empty directory — exactly the guard needed

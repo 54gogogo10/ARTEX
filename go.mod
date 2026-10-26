@@ -2,6 +2,10 @@ module github.com/Autumn-27/artex
 
 go 1.26.3
 
+// Pin the toolchain so builds pick up the latest stdlib security fixes instead
+// of silently compiling with whatever older go the environment happens to have.
+toolchain go1.26.10
+
 require (
 	github.com/Autumn-27/norma v0.4.3
 	github.com/golang-jwt/jwt/v5 v5.3.1

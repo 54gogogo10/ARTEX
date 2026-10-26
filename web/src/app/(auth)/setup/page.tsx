@@ -14,6 +14,7 @@ export default function SetupPage() {
   const router = useRouter();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [checking, setChecking] = useState(true);
@@ -47,7 +48,7 @@ export default function SetupPage() {
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.initPassword(password);
+      const { token } = await api.initPassword(password, code.trim() || undefined);
       auth.setToken(token);
       router.replace("/function/tasks");
     } catch (err) {
@@ -92,6 +93,20 @@ export default function SetupPage() {
             </div>
           ) : (
             <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="init-code">初始化码</Label>
+                <Input
+                  id="init-code"
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                  placeholder="见服务启动时的终端/日志输出（如 K3F9Q-X2M7A）"
+                  autoComplete="off"
+                  className="font-mono uppercase"
+                />
+                <p className="text-xs text-muted-foreground">
+                  为防止局域网内其他主机抢先设置密码，首次初始化需要输入服务端打印的一次性初始化码。
+                </p>
+              </div>
               <div className="space-y-1.5">
                 <Label htmlFor="password">新密码</Label>
                 <Input

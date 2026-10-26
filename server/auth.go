@@ -2,6 +2,8 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math/big"
@@ -200,6 +202,33 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
 }
 
+// genInitCode produces a one-time setup code like "K3F9Q-X2M7A". Empty string
+// only if crypto/rand fails, in which case authInit falls back to no-code mode
+// rather than locking the operator out of a fresh instance.
+func genInitCode() string {
+	b := make([]byte, 5)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	s := hex.EncodeToString(b)
+	return strings.ToUpper(s[:5] + "-" + s[5:])
+}
+
+// requireInitCode validates the one-time setup code (when this boot generated
+// one) against the request. Constant-time compare; the code survives failed
+// attempts and is burned only by a successful init.
+func (s *Server) requireInitCode(w http.ResponseWriter, code string) bool {
+	want, _ := s.initCode.Load().(string)
+	if want == "" {
+		return true // no code issued this boot (password already set when we started)
+	}
+	if subtle.ConstantTimeCompare([]byte(code), []byte(want)) != 1 {
+		writeErr(w, 403, "初始化码不正确（见服务启动时的终端/日志输出）")
+		return false
+	}
+	return true
+}
+
 // POST /api/auth/init — sets the password for the first time; rejected if already set.
 func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
@@ -217,6 +246,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Password string `json:"password"`
+		Code     string `json:"code"`
 	}
 	if err := decode(r, &req); err != nil || req.Password == "" {
 		writeErr(w, 400, "密码不能为空")
@@ -224,6 +254,9 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	}
 	if msg := validatePassword(req.Password); msg != "" {
 		writeErr(w, 400, msg)
+		return
+	}
+	if !s.requireInitCode(w, req.Code) {
 		return
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
@@ -243,6 +276,9 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
+	// 密码落库即烧毁初始化码：后续 authInit 请求都会在"密码已设置"处被拒，
+	// 这里只是把这轮窗口彻底关死。
+	s.initCode.Store("")
 	tok, err := signJWT(s.currentJWTKey())
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")

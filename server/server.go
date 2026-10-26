@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
@@ -51,6 +52,12 @@ type Server struct {
 	jwtKey   []byte
 	jwtKeyMu sync.RWMutex
 	keyDir   string // where jwt.key lives; kept for in-process rotation
+	// initCode holds a one-time setup code (string in atomic.Value) generated at
+	// startup when the admin password is not yet initialised. /api/auth/init
+	// requires it in that window, so a LAN peer or a DNS-rebinding page cannot
+	// race the operator to claim the instance. It is printed to the server log
+	// only (never exposed via any API) and burned after a successful init.
+	initCode atomic.Value
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -181,6 +188,19 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// Wire DB-stored prompt templates into the agents (新版方案 §3.3 / §5a). With no
 	// override row, agents keep their built-in defaults — behavior is unchanged.
 	if m.pg != nil {
+		// 未设密码的实例生成一次性初始化码：/api/auth/init 在此窗口内必须携带
+		// 它（见 authInit）。码只进服务端日志——操作者拥有终端，就能安全完成
+		// 首次设置；局域网里的其他主机和 DNS-rebinding 页面则做不到。
+		if hash, _, err := m.pg.GetSetting(authPassKey); err == nil && hash == "" {
+			if code := genInitCode(); code != "" {
+				s.initCode.Store(code)
+				log.Printf("[auth] ════════════════════════════════════════════════")
+				log.Printf("[auth]   管理员密码尚未设置。首次初始化需要输入初始化码：")
+				log.Printf("[auth]       %s", code)
+				log.Printf("[auth]   （只打印这一次；重启进程会换一个新码）")
+				log.Printf("[auth] ════════════════════════════════════════════════")
+			}
+		}
 		agent.PromptOverride = func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil {
