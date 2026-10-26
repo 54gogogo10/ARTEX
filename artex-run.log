@@ -1,0 +1,17 @@
+
+    _    ____ _____ _______  __
+   / \  |  _ \_   _| ____\ \/ /
+  / _ \ | |_) || | |  _|  \  /
+ / ___ \|  _ < | | | |___ /  \
+/_/   \_\_| \_\|_| |_____/_/\_\
+  AI 自主渗透测试系统
+  版本 dev  ·  windows/amd64  ·  go1.26.10  ·  监听 :8787
+
+2026/10/26 20:55:46 [config] 配置文件: D:\zcode\ARTEX\config.json
+2026/10/26 20:55:46 [pg] 数据库配置来源: 配置文件 D:\zcode\ARTEX\config.json (database 字段)
+2026/10/26 20:55:46 [traffic] recording proxy on 127.0.0.1:8788 (set HTTP_PROXY=http://127.0.0.1:8788 + trust _ca CA)
+time="2026-10-26T20:55:46+08:00" level=info msg="Proxy start listen at 127.0.0.1:8788\n"
+2026/10/26 20:55:46 [mcp] browser MCP 已移除捕获代理配置
+2026/10/26 20:55:46 [config] skill 目录: D:\zcode\ARTEX\skills
+2026/10/26 20:55:46 [engine] no LLM provider configured — engine idle until set via /api/llm or env
+2026/10/26 20:55:46 ARTEX dev backend listening on :8787 (data=D:\zcode\ARTEX\data, workers=3)
